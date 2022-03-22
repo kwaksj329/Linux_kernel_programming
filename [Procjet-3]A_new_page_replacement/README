@@ -1,0 +1,7 @@
+user test program은user폴더에서 make all명령어를 통해 빌드할 수 있습니다.
+./test로 실행되는 파일은 400mb가량의 파일을 open한 뒤 read하기 전과 후 system call을 사용합니다.
+
+./test2로 실행되는 파일은 memory를 malloc을 통해 사용하며 ./test2 20 등으로 사용해 malloc할 memory의 양을 조절할 수 있습니다.
+예시로 ./test 20로 실행했을 시엔 총 100mb의 memory를 alloc하게 됩니다.
+
+kernel.diff의 변경점을 git으로 관리되는 linux폴더에 patch명령어를 이용해 linux-5.15.4에 반영한 뒤 make -j$(nproc)를 이용해 kernel을 빌드할 수 있습니다.

@@ -1,0 +1,349 @@
+diff --git a/Makefile b/Makefile
+index 759e68a02..c633c2477 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1115,7 +1115,7 @@ export MODORDER := $(extmod_prefix)modules.order
+ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/ memstat_syscall/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..182ed0fb8 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -413,5 +413,6 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548	64	memstat_syscall		sys_memstat_syscall
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 7f8ee09c7..f70a10773 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -237,6 +237,7 @@ struct page {
+ #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+ 	int _last_cpupid;
+ #endif
++	atomic_t ref_counter;
+ } _struct_page_alignment;
+ 
+ static inline atomic_t *compound_mapcount_ptr(struct page *page)
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 252243c77..df8ce1bbf 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1272,6 +1272,10 @@ asmlinkage long sys_old_mmap(struct mmap_arg_struct __user *arg);
+  */
+ asmlinkage long sys_ni_syscall(void);
+ 
++/* Add your new system call function */
++
++asmlinkage long sys_memstat_syscall(void);
++
+ #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
+ 
+ 
+diff --git a/init/main.c b/init/main.c
+index bcd132d4e..a8fdb352a 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -112,6 +112,22 @@
+ 
+ #include <kunit/test.h>
+ 
++#include "../memstat_syscall/assign1.h"
++
++struct timer_list ref_counter_timer;
++
++unsigned long num_active_to_inactive;
++unsigned long num_inactive_to_active;
++unsigned long num_evicted_from_inactive;
++
++static void __init initialize_lru_statistics(void)
++{
++	num_active_to_inactive = 0;
++	num_inactive_to_active = 0;
++	num_evicted_from_inactive = 0;
++}
++
++
+ static int kernel_init(void *);
+ 
+ extern void init_IRQ(void);
+@@ -1140,6 +1156,13 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	arch_post_acpi_subsys_init();
+ 	kcsan_init();
+ 
++	initialize_lru_statistics();
++
++	timer_setup(&ref_counter_timer, ref_counter_timer_handler, 0);
++	if(mod_timer(&ref_counter_timer, jiffies + HZ) < 0)
++		pr_info("mod_timer(ref_counter_timer) returned error\n");
++
++
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	arch_call_rest_init();
+ 
+diff --git a/memstat_syscall/Makefile b/memstat_syscall/Makefile
+new file mode 100644
+index 000000000..8f830b6ee
+--- /dev/null
++++ b/memstat_syscall/Makefile
+@@ -0,0 +1 @@
++obj-y += assign1.o
+diff --git a/memstat_syscall/assign1.c b/memstat_syscall/assign1.c
+new file mode 100644
+index 000000000..e01f6df1c
+--- /dev/null
++++ b/memstat_syscall/assign1.c
+@@ -0,0 +1,89 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mmzone.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <asm/bitops.h>
++#include <linux/mm_types.h>
++
++#include "assign1.h"
++/*
++unsigned long num_active_to_inactive;
++unsigned long num_inactive_to_active;
++unsigned long num_evicted_from_inactive;
++*/
++/*
++struct pglist_data *first_online_pgdat(void)
++{
++        return NODE_DATA(first_online_node);
++}
++
++struct pglist_data *next_online_pgdat(struct pglist_data *pgdat)
++{
++        int nid = next_online_node(pgdat->node_id);
++
++        if (nid == MAX_NUMNODES)
++                return NULL;
++        return NODE_DATA(nid);
++}
++*/
++
++SYSCALL_DEFINE0(memstat_syscall)
++{
++	struct pglist_data* pgdat;
++	struct list_head* pos;
++	struct page* page;
++	enum lru_list lru;
++	long anon_active_count, anon_inactive_count;
++	long file_active_count,  file_inactive_count;
++	long anon_active_ref_bit_count, anon_inactive_ref_bit_count;
++	long file_active_ref_bit_count, file_inactive_ref_bit_count;
++	long temp_count, temp_ref_bit_count;
++	for_each_online_pgdat(pgdat){
++		anon_active_count = anon_inactive_count = file_active_count = file_inactive_count = 0;
++		anon_active_ref_bit_count = anon_inactive_ref_bit_count = file_active_ref_bit_count = file_inactive_ref_bit_count = 0;
++		spin_lock_irq(&pgdat->__lruvec.lru_lock);
++		for(lru = 0; lru <= LRU_ACTIVE_FILE; lru++){
++			temp_count = temp_ref_bit_count = 0;
++			list_for_each(pos, &pgdat->__lruvec.lists[lru]){
++				temp_count++;
++				page = lru_to_page(pos);
++				temp_ref_bit_count += test_bit(PG_referenced, &page->flags);
++			}
++			switch(lru)
++			{
++				case LRU_INACTIVE_ANON:
++					anon_inactive_count = temp_count;
++					anon_inactive_ref_bit_count = temp_ref_bit_count;
++					break;
++				case LRU_ACTIVE_ANON:
++					anon_active_count = temp_count;
++					anon_active_ref_bit_count = temp_ref_bit_count;
++					break;
++				case LRU_INACTIVE_FILE:
++					file_inactive_count = temp_count;
++					file_inactive_ref_bit_count = temp_ref_bit_count;
++					break;
++				case LRU_ACTIVE_FILE:
++					file_active_count = temp_count;
++					file_active_ref_bit_count = temp_ref_bit_count;
++					break;
++				case LRU_UNEVICTABLE:
++					break;
++				case NR_LRU_LISTS:
++					break;
++			}
++		}
++		spin_unlock_irq(&pgdat->__lruvec.lru_lock);
++		pr_info("=============================================================\n");
++		pr_info("anon inactive count : %ld, anon inactive ref bits %ld\n", anon_inactive_count, anon_inactive_ref_bit_count);
++		pr_info("anon active count : %ld, anon active ref bits %ld\n", anon_active_count, anon_active_ref_bit_count);
++		pr_info("file inactive count : %ld, file inactive ref bits %ld\n", file_inactive_count, file_inactive_ref_bit_count);
++		pr_info("file active count : %ld, file active ref bits %ld\n", file_active_count, file_active_ref_bit_count);
++		pr_info("num_active_to_inactive : %ld, num_inactive_to_active : %ld\n", num_active_to_inactive, num_inactive_to_active);
++		pr_info("num_evicted_from_inactive : %ld\n", num_evicted_from_inactive);
++		pr_info("=============================================================\n");
++	}
++	return 0;
++}
++
+diff --git a/memstat_syscall/assign1.h b/memstat_syscall/assign1.h
+new file mode 100644
+index 000000000..5fe71288d
+--- /dev/null
++++ b/memstat_syscall/assign1.h
+@@ -0,0 +1,13 @@
++
++#ifndef __ASSIGN1_H
++#define __ASSIGN1_H
++
++#include <linux/timer.h>
++
++extern unsigned long num_active_to_inactive;
++extern unsigned long num_inactive_to_active;
++extern unsigned long num_evicted_from_inactive;
++
++void ref_counter_timer_handler(struct timer_list *tl);
++
++#endif
+diff --git a/mm/swap.c b/mm/swap.c
+index af3cad4e5..d99a28b56 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -42,6 +42,7 @@
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/pagemap.h>
++#include "../memstat_syscall/assign1.h"
+ 
+ /* How many pages do we try to swap or page in/out together? */
+ int page_cluster;
+@@ -424,6 +425,7 @@ void mark_page_accessed(struct page *page)
+ 			__lru_cache_activate_page(page);
+ 		ClearPageReferenced(page);
+ 		workingset_activation(page);
++		num_inactive_to_active++;
+ 	}
+ 	if (page_is_idle(page))
+ 		clear_page_idle(page);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 74296c2d1..f18fab443 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -62,6 +62,12 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/vmscan.h>
+ 
++#include "../memstat_syscall/assign1.h"
++
++#define MAX_REFCOUNTER 100000
++
++extern struct timer_list ref_counter_timer;
++
+ struct scan_control {
+ 	/* How many pages shrink_list() should reclaim */
+ 	unsigned long nr_to_reclaim;
+@@ -1205,6 +1211,28 @@ int remove_mapping(struct address_space *mapping, struct page *page)
+ 	return 0;
+ }
+ 
++void ref_counter_timer_handler(struct timer_list *tl)
++{
++	struct pglist_data* pgdat;
++	struct list_head* pos;
++	struct page* page;
++	enum lru_list lru;
++	for_each_online_pgdat(pgdat){
++		spin_lock_irq(&pgdat->__lruvec.lru_lock);
++		for(lru = 0; lru <= LRU_ACTIVE_FILE; lru++){
++			list_for_each(pos, &pgdat->__lruvec.lists[lru]){
++				page = lru_to_page(pos);
++				if(test_and_clear_bit(PG_referenced, &page->flags))
++					if(atomic_read(&page->ref_counter) != MAX_REFCOUNTER)
++						atomic_inc(&page->ref_counter);
++			}
++		}
++		spin_unlock_irq(&pgdat->__lruvec.lru_lock);
++	}
++	if(mod_timer(&ref_counter_timer, jiffies + HZ / 10) < 0)
++		pr_info("mod_timer(ref_counter_timer) returned error\n");
++}
++
+ /**
+  * putback_lru_page - put previously isolated page onto appropriate LRU list
+  * @page: page to be put back to appropriate lru list
+@@ -1235,6 +1263,8 @@ static enum page_references page_check_references(struct page *page,
+ 
+ 	referenced_ptes = page_referenced(page, 1, sc->target_mem_cgroup,
+ 					  &vm_flags);
++	if(atomic_add_return(referenced_ptes, &page->ref_counter) > MAX_REFCOUNTER)
++		atomic_set(&page->ref_counter, MAX_REFCOUNTER);
+ 	referenced_page = TestClearPageReferenced(page);
+ 
+ 	/*
+@@ -1243,8 +1273,8 @@ static enum page_references page_check_references(struct page *page,
+ 	 */
+ 	if (vm_flags & VM_LOCKED)
+ 		return PAGEREF_RECLAIM;
+-
+-	if (referenced_ptes) {
++	if (atomic_read(&page->ref_counter)) {
++		atomic_dec(&page->ref_counter);
+ 		/*
+ 		 * All mapped pages start out with page table
+ 		 * references from the instantiating fault, so we need
+@@ -1805,7 +1835,7 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 	}
+ 
+ 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
+-
++	num_inactive_to_active += pgactivate;
+ 	mem_cgroup_uncharge_list(&free_pages);
+ 	try_to_unmap_flush();
+ 	free_unref_page_list(&free_pages);
+@@ -1813,6 +1843,7 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 	list_splice(&ret_pages, page_list);
+ 	count_vm_events(PGACTIVATE, pgactivate);
+ 
++	num_evicted_from_inactive += nr_reclaimed;
+ 	return nr_reclaimed;
+ }
+ 
+@@ -2356,7 +2387,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 	unsigned nr_rotated = 0;
+ 	int file = is_file_lru(lru);
+ 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+-
++	int ref_bit;
+ 	lru_add_drain();
+ 
+ 	spin_lock_irq(&lruvec->lru_lock);
+@@ -2390,8 +2421,12 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 			}
+ 		}
+ 
+-		if (page_referenced(page, 0, sc->target_mem_cgroup,
+-				    &vm_flags)) {
++		ref_bit = page_referenced(page, 0, sc->target_mem_cgroup,
++				    &vm_flags);
++		if (atomic_add_return(ref_bit, &page->ref_counter) > MAX_REFCOUNTER)
++			atomic_set(&page->ref_counter, MAX_REFCOUNTER);       
++		if (atomic_read(&page->ref_counter)){
++			atomic_dec(&page->ref_counter);
+ 			/*
+ 			 * Identify referenced, file-backed active pages and
+ 			 * give them one more trip around the active list. So
+@@ -2420,6 +2455,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 
+ 	nr_activate = move_pages_to_lru(lruvec, &l_active);
+ 	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
++	num_active_to_inactive += nr_deactivate;
++
+ 	/* Keep all free pages in l_active list */
+ 	list_splice(&l_inactive, &l_active);
+ 
